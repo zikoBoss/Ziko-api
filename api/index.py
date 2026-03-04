@@ -1,415 +1,218 @@
-# api/index.py - Free Fire Friends API
-# Developer: ZAKARIA
-# يستقبل طلبات من موقعك ويتواصل مع البوت الخفي
-
 from flask import Flask, request, jsonify
 import requests
 import json
 import os
 import time
-import threading
 from datetime import datetime
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==================== إعدادات حساب Free Fire ====================
+FF_UID = "4378068850"
+FF_PASSWORD = "8C583277F6A0221993BAC8FBBD712BC25B171A445A34FB1DD0966609CB74729D"
 
 app = Flask(__name__)
 
-# ==================== الإعدادات ====================
-BOT_URL = "https://your-bot-service.com"  # ⚠️ غيّر هذا إلى رابط البوت الخفي بعد نشره
-BOT_API_KEY = "ZAKARIA_SECRET_2024"  # مفتاح سري للتواصل مع البوت
+# ==================== دوال مساعدة من byte.py ====================
+def encrypt_api(plain_text):
+    """تشفير البيانات المرسلة"""
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+    plain_text = bytes.fromhex(plain_text)
+    key = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
+    iv = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    cipher_text = cipher.encrypt(pad(plain_text, AES.block_size))
+    return cipher_text.hex()
 
-# ملف التخزين (Vercel يسمح فقط بـ /tmp)
-DATA_FILE = '/tmp/freefire_data.json'
-
-# ==================== دوال التعامل مع الملف ====================
-def load_data():
-    """تحميل البيانات من الملف"""
-    try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'r') as f:
-                return json.load(f)
-    except:
-        pass
-    return {"friends": {}}  # friends: { "uid": {"added_at": timestamp, "expiry": timestamp} }
-
-def save_data(data):
-    """حفظ البيانات في الملف"""
-    try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data, f)
-    except:
-        pass
-
-# ==================== فحص الصلاحية تلقائياً ====================
-def check_expired_friends():
-    """دالة تعمل في الخلفية لفحص الأصدقاء منتهية الصلاحية وحذفهم"""
+def Encrypt_ID(number):
+    """تشفير معرف اللاعب"""
+    number = int(number)
+    encoded_bytes = []
     while True:
-        try:
-            data = load_data()
-            current_time = int(time.time())
-            modified = False
-            
-            # قائمة بالأصدقاء الذين انتهت صلاحيتهم
-            expired = []
-            for uid, info in data["friends"].items():
-                if info["expiry"] <= current_time:
-                    expired.append(uid)
-            
-            # حذف كل من انتهت صلاحيته
-            if expired:
-                # إرسال طلب حذف إلى البوت الخلفي
-                try:
-                    response = requests.post(
-                        f"{BOT_URL}/execute",
-                        json={
-                            'action': 'cleanup',
-                            'expired_list': expired,
-                            'api_key': BOT_API_KEY
-                        },
-                        timeout=10
-                    )
-                    
-                    if response.status_code == 200:
-                        for uid in expired:
-                            del data["friends"][uid]
-                            modified = True
-                            print(f"[🗑️] تم حذف {uid} - انتهت الصلاحية")
-                except:
-                    print(f"[⚠️] فشل الاتصال بالبوت الخفي")
-            
-            if modified:
-                save_data(data)
-                
-        except Exception as e:
-            print(f"[⚠️] خطأ في فحص الصلاحية: {e}")
+        byte = number & 0x7F
+        number >>= 7
+        if number:
+            byte |= 0x80
+        encoded_bytes.append(byte)
+        if not number:
+            break
+    return bytes(encoded_bytes).hex()
+
+# ==================== الحصول على توكن جديد ====================
+def get_fresh_token():
+    """جلب توكن جديد مباشرة من Garena"""
+    try:
+        print(f"[ℹ️] محاولة الحصول على توكن للحساب: {FF_UID}")
         
-        # ننتظر ساعة قبل الفحص التالي
-        time.sleep(3600)
+        url = "https://100067.connect.garena.com/oauth/guest/token/grant"
+        headers = {
+            "Host": "100067.connect.garena.com",
+            "User-Agent": "GarenaMSDK/4.0.19P4",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        data = {
+            "uid": FF_UID,
+            "password": FF_PASSWORD,
+            "response_type": "token",
+            "client_type": "2",
+            "client_id": "100067",
+            "client_secret": ""
+        }
+        
+        r = requests.post(url, headers=headers, data=data, timeout=15)
+        
+        if r.status_code == 200:
+            token_data = r.json()
+            access_token = token_data.get("access_token")
+            print(f"[✅] تم الحصول على توكن جديد")
+            return access_token
+        else:
+            print(f"[❌] فشل الحصول على توكن: {r.status_code}")
+            print(f"[ℹ️] الاستجابة: {r.text}")
+            return None
+    except Exception as e:
+        print(f"[❌] خطأ في get_fresh_token: {e}")
+        return None
 
-# تشغيل فحص الصلاحية في خلفية منفصلة
-threading.Thread(target=check_expired_friends, daemon=True).start()
+# ==================== إضافة صديق ====================
+def add_friend_direct(token, target_uid):
+    """إرسال طلب إضافة صديق"""
+    try:
+        encrypted_id = Encrypt_ID(target_uid)
+        payload = f"08a7c4839f1e10{encrypted_id}1801"
+        payload_bytes = bytes.fromhex(encrypt_api(payload))
 
-# ==================== دوال مساعدة ====================
-def format_time(seconds):
-    """تحويل الثواني إلى نص مفهوم"""
-    if seconds <= 0:
-        return 'منتهية الصلاحية'
-    
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    
-    if days > 0:
-        return f'{days} يوم و {hours} ساعة'
-    elif hours > 0:
-        return f'{hours} ساعة و {minutes} دقيقة'
-    else:
-        return f'{minutes} دقيقة'
+        url = "https://clientbp.ggpolarbear.com/RequestAddingFriend"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Unity-Version": "2018.4.11f1",
+            "X-GA": "v1 1",
+            "ReleaseVersion": "OB52",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": str(len(payload_bytes)),
+            "User-Agent": "Dalvik/2.1.0 (Linux; Android 9)",
+            "Connection": "close",
+        }
+        
+        response = requests.post(url, headers=headers, data=payload_bytes, timeout=10)
+        
+        if response.status_code == 200:
+            print(f"[✅] تم إضافة {target_uid} بنجاح")
+            return True, "تمت الإضافة بنجاح"
+        else:
+            print(f"[❌] فشل إضافة {target_uid}: {response.status_code}")
+            return False, f"خطأ: {response.status_code}"
+            
+    except Exception as e:
+        print(f"[❌] خطأ في add_friend_direct: {e}")
+        return False, str(e)
 
-# ==================== نقطة النهاية الرئيسية ====================
+# ==================== حذف صديق ====================
+def remove_friend_direct(token, target_uid):
+    """إرسال طلب حذف صديق"""
+    try:
+        encrypted_id = Encrypt_ID(target_uid)
+        payload = f"08a7c4839f1e10{encrypted_id}1801"
+        payload_bytes = bytes.fromhex(encrypt_api(payload))
+
+        url = "https://clientbp.ggpolarbear.com/RemoveFriend"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Unity-Version": "2018.4.11f1",
+            "X-GA": "v1 1",
+            "ReleaseVersion": "OB52",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": str(len(payload_bytes)),
+            "User-Agent": "Dalvik/2.1.0 (Linux; Android 9)",
+            "Connection": "close",
+        }
+        
+        response = requests.post(url, headers=headers, data=payload_bytes, timeout=10)
+        
+        if response.status_code == 200:
+            print(f"[✅] تم حذف {target_uid} بنجاح")
+            return True, "تم الحذف بنجاح"
+        else:
+            print(f"[❌] فشل حذف {target_uid}: {response.status_code}")
+            return False, f"خطأ: {response.status_code}"
+            
+    except Exception as e:
+        print(f"[❌] خطأ في remove_friend_direct: {e}")
+        return False, str(e)
+
+# ==================== نقاط النهاية ====================
+
 @app.route('/', methods=['GET'])
 def home():
-    """الصفحة الرئيسية"""
-    data = load_data()
-    current_time = int(time.time())
-    
-    # تحديث حالة كل صديق
-    friends_list = []
-    for uid, info in data["friends"].items():
-        remaining = info["expiry"] - current_time
-        friends_list.append({
-            'uid': uid,
-            'added_at': info['added_at'],
-            'expiry': info['expiry'],
-            'remaining_seconds': remaining,
-            'remaining_text': format_time(remaining),
-            'status': 'نشط' if remaining > 0 else 'منتهي'
-        })
-    
     return jsonify({
-        'name': 'Free Fire Friends API',
-        'version': '2.0.0',
+        'name': 'Free Fire Simple API',
+        'version': '1.0.0',
         'developer': 'ZAKARIA',
-        'documentation': 'https://your-website.com/api-docs',
         'endpoints': {
             '/add': 'إضافة صديق - /add?uid=123456789',
-            '/remove': 'حذف صديق - /remove?uid=123456789',
-            '/list': 'عرض جميع الأصدقاء - /list',
-            '/check': 'التحقق من صديق - /check?uid=123456789'
+            '/remove': 'حذف صديق - /remove?uid=123456789'
         },
-        'friends_count': len(friends_list),
-        'friends': friends_list
+        'account': FF_UID
     })
 
-# ==================== 1️⃣ إضافة صديق ====================
 @app.route('/add', methods=['GET'])
-def add_friend():
-    """
-    إضافة صديق جديد
-    /add?uid=123456789
-    """
+def add():
+    """إضافة صديق"""
     uid = request.args.get('uid')
     
     if not uid:
-        return jsonify({
-            'success': False,
-            'error': 'يجب إرسال uid'
-        }), 400
+        return jsonify({'success': False, 'error': 'يجب إرسال uid'}), 400
     
     if not uid.isdigit():
-        return jsonify({
-            'success': False,
-            'error': 'uid يجب أن يكون أرقاماً فقط'
-        }), 400
+        return jsonify({'success': False, 'error': 'uid يجب أن يكون أرقاماً'}), 400
     
-    # تحميل البيانات
-    data = load_data()
+    # 1. الحصول على توكن جديد
+    token = get_fresh_token()
+    if not token:
+        return jsonify({'success': False, 'error': 'فشل الحصول على توكن'}), 503
     
-    # التحقق إذا كان الصديق موجوداً مسبقاً
-    if uid in data["friends"]:
-        remaining = data["friends"][uid]["expiry"] - int(time.time())
-        if remaining > 0:
-            return jsonify({
-                'success': False,
-                'error': 'هذا الصديق موجود بالفعل',
-                'remaining_seconds': remaining,
-                'remaining_text': format_time(remaining)
-            }), 400
-    
-    # إرسال طلب إضافة إلى البوت الخفي
-    try:
-        response = requests.post(
-            f"{BOT_URL}/execute",
-            json={
-                'action': 'add',
-                'target_uid': uid,
-                'api_key': BOT_API_KEY
-            },
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            bot_result = response.json()
-            
-            if bot_result.get('success'):
-                # حساب وقت انتهاء الصلاحية (24 ساعة)
-                current_time = int(time.time())
-                expiry_time = current_time + (24 * 3600)
-                
-                # حفظ الصديق
-                data["friends"][uid] = {
-                    'added_at': current_time,
-                    'expiry': expiry_time
-                }
-                save_data(data)
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'✅ تم إضافة {uid} بنجاح',
-                    'uid': uid,
-                    'added_at': current_time,
-                    'expiry': expiry_time,
-                    'expiry_text': format_time(24 * 3600)
-                })
-            else:
-                return jsonify({
-                    'success': False,
-                    'error': bot_result.get('error', 'فشل الإضافة')
-                }), 400
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'البوت الخفي غير متاح'
-            }), 503
-            
-    except requests.exceptions.RequestException:
-        return jsonify({
-            'success': False,
-            'error': 'فشل الاتصال بالبوت الخفي'
-        }), 503
-
-# ==================== 2️⃣ حذف صديق ====================
-@app.route('/remove', methods=['GET'])
-def remove_friend():
-    """
-    حذف صديق
-    /remove?uid=123456789
-    """
-    uid = request.args.get('uid')
-    
-    if not uid:
-        return jsonify({
-            'success': False,
-            'error': 'يجب إرسال uid'
-        }), 400
-    
-    # تحميل البيانات
-    data = load_data()
-    
-    # التحقق من وجود الصديق
-    if uid not in data["friends"]:
-        return jsonify({
-            'success': False,
-            'error': 'هذا الصديق غير موجود'
-        }), 404
-    
-    # إرسال طلب حذف إلى البوت الخفي
-    try:
-        response = requests.post(
-            f"{BOT_URL}/execute",
-            json={
-                'action': 'remove',
-                'target_uid': uid,
-                'api_key': BOT_API_KEY
-            },
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            bot_result = response.json()
-            
-            if bot_result.get('success'):
-                # حذف من البيانات المحلية
-                del data["friends"][uid]
-                save_data(data)
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'✅ تم حذف {uid} بنجاح'
-                })
-            else:
-                return jsonify({
-                    'success': False,
-                    'error': bot_result.get('error', 'فشل الحذف')
-                }), 400
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'البوت الخفي غير متاح'
-            }), 503
-            
-    except requests.exceptions.RequestException:
-        return jsonify({
-            'success': False,
-            'error': 'فشل الاتصال بالبوت الخفي'
-        }), 503
-
-# ==================== 3️⃣ عرض جميع الأصدقاء ====================
-@app.route('/list', methods=['GET'])
-def list_friends():
-    """
-    عرض جميع الأصدقاء
-    /list
-    """
-    data = load_data()
-    current_time = int(time.time())
-    
-    friends_list = []
-    for uid, info in data["friends"].items():
-        remaining = info["expiry"] - current_time
-        friends_list.append({
-            'uid': uid,
-            'added_at': info['added_at'],
-            'added_at_text': datetime.fromtimestamp(info['added_at']).strftime('%Y-%m-%d %H:%M:%S'),
-            'expiry': info['expiry'],
-            'expiry_text': datetime.fromtimestamp(info['expiry']).strftime('%Y-%m-%d %H:%M:%S'),
-            'remaining_seconds': remaining,
-            'remaining_text': format_time(remaining),
-            'status': 'نشط' if remaining > 0 else 'منتهي'
-        })
-    
-    # ترتيب حسب وقت الإضافة (الأحدث أولاً)
-    friends_list.sort(key=lambda x: x['added_at'], reverse=True)
+    # 2. إرسال طلب الإضافة
+    success, message = add_friend_direct(token, uid)
     
     return jsonify({
-        'success': True,
-        'count': len(friends_list),
-        'active_count': len([f for f in friends_list if f['status'] == 'نشط']),
-        'expired_count': len([f for f in friends_list if f['status'] == 'منتهي']),
-        'friends': friends_list
-    })
-
-# ==================== 4️⃣ التحقق من صديق معين ====================
-@app.route('/check', methods=['GET'])
-def check_friend():
-    """
-    التحقق من صديق معين
-    /check?uid=123456789
-    """
-    uid = request.args.get('uid')
-    
-    if not uid:
-        return jsonify({
-            'success': False,
-            'error': 'يجب إرسال uid'
-        }), 400
-    
-    data = load_data()
-    
-    if uid not in data["friends"]:
-        return jsonify({
-            'success': False,
-            'error': 'هذا الصديق غير موجود'
-        }), 404
-    
-    info = data["friends"][uid]
-    current_time = int(time.time())
-    remaining = info["expiry"] - current_time
-    
-    return jsonify({
-        'success': True,
+        'success': success,
+        'message': message,
         'uid': uid,
-        'added_at': info['added_at'],
-        'added_at_text': datetime.fromtimestamp(info['added_at']).strftime('%Y-%m-%d %H:%M:%S'),
-        'expiry': info['expiry'],
-        'expiry_text': datetime.fromtimestamp(info['expiry']).strftime('%Y-%m-%d %H:%M:%S'),
-        'remaining_seconds': remaining,
-        'remaining_text': format_time(remaining),
-        'status': 'نشط' if remaining > 0 else 'منتهي'
+        'account': FF_UID
     })
 
-# ==================== 5️⃣ تحديث يدوي للصلاحية ====================
-@app.route('/cleanup', methods=['GET'])
-def manual_cleanup():
-    """
-    تنظيف الأصدقاء منتهية الصلاحية يدوياً
-    /cleanup
-    """
-    try:
-        data = load_data()
-        current_time = int(time.time())
-        expired = [uid for uid, info in data["friends"].items() if info["expiry"] <= current_time]
-        
-        if expired:
-            response = requests.post(
-                f"{BOT_URL}/execute",
-                json={
-                    'action': 'cleanup',
-                    'expired_list': expired,
-                    'api_key': BOT_API_KEY
-                },
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                for uid in expired:
-                    del data["friends"][uid]
-                save_data(data)
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'✅ تم حذف {len(expired)} صديق منتهي الصلاحية',
-                    'deleted': expired
-                })
-        
-        return jsonify({
-            'success': True,
-            'message': 'لا يوجد أصدقاء منتهية الصلاحية'
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+@app.route('/remove', methods=['GET'])
+def remove():
+    """حذف صديق"""
+    uid = request.args.get('uid')
+    
+    if not uid:
+        return jsonify({'success': False, 'error': 'يجب إرسال uid'}), 400
+    
+    # 1. الحصول على توكن جديد
+    token = get_fresh_token()
+    if not token:
+        return jsonify({'success': False, 'error': 'فشل الحصول على توكن'}), 503
+    
+    # 2. إرسال طلب الحذف
+    success, message = remove_friend_direct(token, uid)
+    
+    return jsonify({
+        'success': success,
+        'message': message,
+        'uid': uid,
+        'account': FF_UID
+    })
+
+@app.route('/test', methods=['GET'])
+def test():
+    """اختبار الحساب"""
+    token = get_fresh_token()
+    if token:
+        return jsonify({'success': True, 'message': 'الحساب يعمل', 'account': FF_UID})
+    else:
+        return jsonify({'success': False, 'message': 'فشل الاتصال بالحساب'}), 503
 
 # للاختبار المحلي
 if __name__ == '__main__':
